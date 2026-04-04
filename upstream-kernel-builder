@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #------------------------------------------------------------------------------
 #
-# File:         upstream_kernel_builder_v6
+# File:         upstream-kernel-builder
 #   
 # Description:  Builds upstream Linux kernel and installs to a host running
 #               Fedora. Supports explicit configure, clean, build, install,
@@ -17,17 +17,23 @@
 # Examples: 
 # --------- 
 # Configure and build:
-#   $ ./upstream_kernel_builder_v6 -l chopin -a aarch64 -c \
-#       -k ~/projects/orangepi5plus/upstream_kernel_config_opi5plus.txt -B
+#   $ time ./upstream-kernel-builder -l chopin -a aarch64 -c -b \
+#       -k ~/projects/orangepi5plus/upstream_kernel_config_opi5plus.txt
 #
 # Clean and rebuild:
-#   $ ./upstream_kernel_builder_v6 -l chopin -a aarch64 -C -B
+#   $ ./upstream-kernel-builder -l chopin -a aarch64 -C -b
+#
+# Deep clean:
+#   $ rm -rf $KERNEL_BUILD_DIR
 #
 # Incremental rebuild:
-#   $ ./upstream_kernel_builder_v6 -l chopin -a aarch64 -B
+#   $ ./upstream-kernel-builder -l chopin -a aarch64 -b
 #
-# Install-only:
-#   $ ./upstream_kernel_builder_v6 -l chopin -t orthanc -i grub
+# Install:
+#   $ ./upstream-kernel-builder -l chopin -t orthanc -i -B grub
+#
+# Uninstall:
+#   $ ./upstream-kernel-builder -l chopin -t orthanc -u -B grub
 #------------------------------------------------------------------------------
 
 set -euo pipefail
@@ -35,10 +41,11 @@ set -euo pipefail
 TARGET_HOST=""
 BUILD_ARCH="${BUILD_ARCH:-aarch64}"
 KERNEL_RELEASE=""
-INSTALL_MODE=""
+BOOT_CHAIN_TYPE=""
 DO_CONFIG=false
 DO_CLEAN=false
 DO_BUILD=false
+DO_INSTALL=false
 DO_UNINSTALL=false
 DEBUG_CONFIG=false
 LOCALVERSION_TAG=""
@@ -84,17 +91,17 @@ Usage: $0 [options]
 
 Options:
   -a <x86_64|aarch64|riscv64>   Architecture (default: aarch64)
-  -t <target_host>              Target host for deployment (required for install/uninstall)
-  -l <tag|none>                 Set CONFIG_LOCALVERSION to -<tag> (or empty for none)
-  -k <config_file>              Apply Kconfig from file
+  -b                            Build the kernel (Image, modules, dtbs)
+  -B <boot|grub|extlinux|rpm>   Boot chain type
   -c                            Configure kernel
   -C                            Clean build tree (make clean)
-  -B                            Build the kernel (Image modules dtbs)
   -d                            Configure kernel for debugging (requires -c)
-  -f                            Configure kernel for fast dev loop (requires -c)
-  -i <boot|grub|extlinux|rpm>   Installation mode (focus: grub)
-  -u                            Uninstall the selected build from target
+  -i                            Install on the specified target
   -h                            Help
+  -k <config_file>              Apply Kconfig from file
+  -l <tag|none>                 Set CONFIG_LOCALVERSION to -<tag> (or empty for none)
+  -t <target_host>              Target host for deployment (required for install/uninstall)
+  -u                            Uninstall on the specified target
 
 Env:
   KERNEL_SRC_DIR=$KERNEL_SRC_DIR
@@ -103,19 +110,20 @@ USAGE
     exit 1
 }
 
-while getopts "a:t:l:k:cCBdhi:u" opt; do
+while getopts "a:bB:cCdhik:l:t:u" opt; do
     case $opt in
         a) BUILD_ARCH="$OPTARG" ;;
-        t) TARGET_HOST="$OPTARG" ;;
-        l) LOCALVERSION_TAG="$OPTARG" ;;
-        k) KERNEL_CONFIG_FILE="$OPTARG" ;;
+        b) DO_BUILD=true ;;
+        B) BOOT_CHAIN_TYPE="$OPTARG" ;;
         c) DO_CONFIG=true ;;
         C) DO_CLEAN=true ;;
-        B) DO_BUILD=true ;;
         d) DEBUG_CONFIG=true ;;
-        i) INSTALL_MODE="$OPTARG" ;;
-        u) DO_UNINSTALL=true ;;
         h) usage ;;
+        i) DO_INSTALL=true ;;
+        k) KERNEL_CONFIG_FILE="$OPTARG" ;;
+        l) LOCALVERSION_TAG="$OPTARG" ;;
+        t) TARGET_HOST="$OPTARG" ;;
+        u) DO_UNINSTALL=true ;;
         *) usage ;;
     esac
 done
@@ -156,22 +164,35 @@ fi
 
 create_log_file()
 {
-    local ts gccv host
+    local ts gccv host op op_pretty
     ts="$(date +"%Y_%m_%d_%H%M")"
     gccv="$(gcc --version | head -n 1 || true)"
     host="$(hostname -s 2>/dev/null || echo unknown)"
 
+    if [[ "$DO_UNINSTALL" == true ]]; then
+        op="uninstall"
+        op_pretty="Uninstall"
+    elif [[ "$DO_INSTALL" == true ]]; then
+        op="install"
+        op_pretty="Install"
+    else
+        op="build"
+        op_pretty="Build"
+    fi
+
     mkdir -p "$LOG_DIR"
-    LOG_FILE="$LOG_DIR/upstream_kernel_build_${ts}.log"
+    LOG_FILE="$LOG_DIR/upstream_kernel_${op}_${ts}.log"
 
     {
         echo "//---------------------------------------------------------------"
-        echo "// Upstream Kernel Build"
+        echo "// Upstream Kernel ${op_pretty}"
         echo "// Date: $(date)"
         echo "// Host: ${host}"
         echo "// ARCH: ${BUILD_ARCH}"
         echo "// KERNEL_SRC_DIR =   ${KERNEL_SRC_DIR}"
         echo "// KERNEL_BUILD_DIR = ${KERNEL_BUILD_DIR}"
+        echo "// TARGET_HOST =      ${TARGET_HOST:-<none>}"
+        echo "// BOOT_CHAIN_TYPE =  ${BOOT_CHAIN_TYPE:-<none>}"
         echo "// GCC: ${gccv}"
         echo "// LOCALVERSION: ${LOCALVERSION}"
         echo "// KCONFIG FILE: ${KERNEL_CONFIG_FILE:-<none>}"
@@ -224,9 +245,9 @@ validate_architecture()
     esac
 }
 
-validate_install_mode()
+validate_boot_chain_mode()
 {
-    case "${1:-}" in ""|boot|grub|extlinux|rpm) : ;; *)
+    case "${1:-}" in ""|grub|extlinux|rpm) : ;; *)
         echo "${BOLD}${RED}Error: Unsupported install mode: ${CYAN}$1"
         echo "${NORMAL}"
         exit 2
@@ -239,6 +260,34 @@ validate_local_commands()
     for cmd in "${REQUIRED_CMDS[@]}"; do
         command -v "$cmd" >/dev/null 2>&1 || { printf 'Missing cmd: %s\n' "$cmd" >&2; exit 127; }
     done
+}
+
+validate_target_commands()
+{
+    local target_op=false
+
+    if [[ "$DO_INSTALL" == true || "$DO_UNINSTALL" == true ]]; then
+        target_op=true
+    fi
+
+    if [[ "$target_op" != true ]]; then
+        return 0
+    fi
+
+    if [[ "$DO_INSTALL" == true && "$DO_UNINSTALL" == true ]]; then
+        echo "ERROR: specify only one of -i (install) or -u (uninstall)" >&2
+        exit 2
+    fi
+
+    if [[ -z "$TARGET_HOST" ]]; then
+        echo "ERROR: -t <target_host> is required for install/uninstall" >&2
+        exit 2
+    fi
+
+    if [[ -z "$BOOT_CHAIN_TYPE" ]]; then
+        echo "ERROR: -B <boot_chain_type> is required for install/uninstall" >&2
+        exit 2
+    fi
 }
 
 ensure_remote_sudo()
@@ -564,41 +613,81 @@ build_kernel()
         rc=$?; status_end_fail "   - Verifying localversion config" "$rc"; return "$rc"
     fi
 
-    local -a MAKE_CMD=(
+    local -a MAKE_BASE_CMD=(
         make -C "$KERNEL_SRC_DIR" -j"$(nproc)"
         O="$KERNEL_BUILD_DIR" ARCH=arm64
-        Image modules dtbs
     )
 
     {
         echo
         echo "== Build begin"
         echo "   When:   $(date '+%F %T')"
-        echo -n "   Cmd:    "
-        printf '%q ' "${MAKE_CMD[@]}"
-        echo
         echo "   Log:    $LOG_FILE"
     } >>"$LOG_FILE"
 
-    status_begin "   - Building kernel (Image, modules, DTBs)"
+    status_begin "   - Building kernel Image"
     start="$(date +%s)"
-    if "${MAKE_CMD[@]}" >>"$LOG_FILE" 2>&1; then
+    if "${MAKE_BASE_CMD[@]}" Image >>"$LOG_FILE" 2>&1; then
         end="$(date +%s)"; dur=$(( end - start ))
         {
-            echo "== Build end"
+            echo "== Build Image end"
             echo "   When:   $(date '+%F %T')"
             echo "   Elapsed: $((dur/60))m $((dur%60))s"
         } >>"$LOG_FILE"
-        status_end_ok "   - Building kernel (Image, modules, DTBs)"
+        status_end_ok "   - Building kernel Image"
     else
         rc=$?
         end="$(date +%s)"; dur=$(( end - start ))
         {
-            echo "== Build end [FAILED rc=${rc}]"
+            echo "== Build Image end [FAILED rc=${rc}]"
             echo "   When:   $(date '+%F %T')"
             echo "   Elapsed: $((dur/60))m $((dur%60))s"
         } >>"$LOG_FILE"
-        status_end_fail "   - Building kernel (Image, modules, DTBs)" "$rc"
+        status_end_fail "   - Building kernel Image" "$rc"
+        return "$rc"
+    fi
+
+    status_begin "   - Building modules"
+    start="$(date +%s)"
+    if "${MAKE_BASE_CMD[@]}" modules >>"$LOG_FILE" 2>&1; then
+        end="$(date +%s)"; dur=$(( end - start ))
+        {
+            echo "== Build modules end"
+            echo "   When:   $(date '+%F %T')"
+            echo "   Elapsed: $((dur/60))m $((dur%60))s"
+        } >>"$LOG_FILE"
+        status_end_ok "   - Building modules"
+    else
+        rc=$?
+        end="$(date +%s)"; dur=$(( end - start ))
+        {
+            echo "== Build modules end [FAILED rc=${rc}]"
+            echo "   When:   $(date '+%F %T')"
+            echo "   Elapsed: $((dur/60))m $((dur%60))s"
+        } >>"$LOG_FILE"
+        status_end_fail "   - Building modules" "$rc"
+        return "$rc"
+    fi
+
+    status_begin "   - Building DTBs"
+    start="$(date +%s)"
+    if "${MAKE_BASE_CMD[@]}" dtbs >>"$LOG_FILE" 2>&1; then
+        end="$(date +%s)"; dur=$(( end - start ))
+        {
+            echo "== Build DTBs end"
+            echo "   When:   $(date '+%F %T')"
+            echo "   Elapsed: $((dur/60))m $((dur%60))s"
+        } >>"$LOG_FILE"
+        status_end_ok "   - Building DTBs"
+    else
+        rc=$?
+        end="$(date +%s)"; dur=$(( end - start ))
+        {
+            echo "== Build DTBs end [FAILED rc=${rc}]"
+            echo "   When:   $(date '+%F %T')"
+            echo "   Elapsed: $((dur/60))m $((dur%60))s"
+        } >>"$LOG_FILE"
+        status_end_fail "   - Building DTBs" "$rc"
         return "$rc"
     fi
 
@@ -722,7 +811,9 @@ install_kernel_for_grub()
     local SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
     [[ -n "$KERNEL_RELEASE" ]] || KERNEL_RELEASE="$(get_kernel_release)"
 
-    echo "${WHITE}Installing on ${CYAN}${TARGET_HOST}${NORMAL}:"
+    echo "${WHITE}Installing on ${CYAN}${TARGET_HOST}${WHITE}:${NORMAL}"
+    echo "${WHITE}   - Log file: ${CYAN}${LOG_FILE}${NORMAL}"
+    echo "${WHITE}   - Using existing build: ${CYAN}${KERNEL_RELEASE}${NORMAL}"
 
     local label rc CMDLINE
     label="   - Installing to boot partition"
@@ -870,34 +961,61 @@ uninstall_kernel_for_grub()
     echo ""
 }
 
+uninstall_kernel()
+{
+    case "$BOOT_CHAIN_TYPE" in
+        grub)
+            uninstall_kernel_for_grub
+            ;;
+        boot)
+            echo "ERROR: uninstall for boot chain type 'boot' is not implemented" >&2
+            exit 2
+            ;;
+        extlinux)
+            echo "ERROR: uninstall for boot chain type 'extlinux' is not implemented" >&2
+            exit 2
+            ;;
+        rpm)
+            echo "ERROR: uninstall for boot chain type 'rpm' is not implemented" >&2
+            exit 2
+            ;;
+        *)
+            echo "ERROR: unsupported boot chain type for uninstall: $BOOT_CHAIN_TYPE" >&2
+            exit 2
+            ;;
+    esac
+}
+
 main()
 {
     validate_architecture
     validate_local_commands
-    validate_install_mode "$INSTALL_MODE"
+    validate_target_commands
+    validate_boot_chain_mode "$BOOT_CHAIN_TYPE"
 
-    if [[ "DEBUG_CONFIG" == true || -n "$KERNEL_CONFIG_FILE" ]]; then
+    if [[ "$DEBUG_CONFIG" == true || -n "$KERNEL_CONFIG_FILE" ]]; then
         if [[ "$DO_CONFIG" != true ]]; then
-            echo "${BOLD}${RED}Error: -d, -f, and -k require -c"
+            echo "${BOLD}${RED}Error: -d and -k require -c"
             echo "${NORMAL}"
             exit 2
         fi
     fi
 
-    if [[ "$DO_UNINSTALL" == true && -n "$INSTALL_MODE" ]]; then
-        echo "ERROR: -u (uninstall) cannot be used together with -i (install mode)" >&2
-        exit 2
-    fi
-
     local need_target=false
-    if [[ -n "$INSTALL_MODE" || "$DO_UNINSTALL" == true ]]; then
+
+    if [[ "$DO_INSTALL" == true || "$DO_UNINSTALL" == true ]]; then
         need_target=true
     fi
 
     echo ""
 
-    if [[ "$DO_UNINSTALL" != true ]]; then
-        create_log_file
+    create_log_file
+
+    # If this is an Orin Nano, set for performance mode.
+    if grep -q "Orin Nano" /sys/firmware/devicetree/base/model; then
+        echo "${WHITE}Setting for performance mode on Orin Nano..."
+        echo "${NORMAL}"
+        sudo cpupower frequency-set -g performance > /dev/null 2>&1
     fi
 
     if [[ "$DO_CONFIG" == true ]]; then
@@ -925,30 +1043,29 @@ main()
     fi
 
     if [[ "$DO_UNINSTALL" == true ]]; then
-        echo "${WHITE}Uninstalling on ${CYAN}${TARGET_HOST}${WHITE}...${NORMAL}:"
+        echo "${WHITE}Uninstalling on ${CYAN}${TARGET_HOST}${WHITE}:${NORMAL}"
+        echo "${WHITE}   - Log file: ${CYAN}${LOG_FILE}${NORMAL}"
         status_begin "   - Resolving target release to uninstall"
         KERNEL_RELEASE="$(resolve_remote_kernel_release_for_uninstall || true)"
         if [[ -n "$KERNEL_RELEASE" ]]; then
             status_end_ok "   - Resolving target release to uninstall"
         else
             status_end_fail "   - Resolving target release to uninstall" 66
-            echo "${BOLD}${RED}Error: could not determine which kernel to uninstall on ${CYAN}${TARGET_HOST}"
+            echo "${BOLD}${RED}No installed kernel matching localversion '${LOCALVERSION}' was found on ${CYAN}${TARGET_HOST}${NORMAL}"
             echo "${NORMAL}"
             exit 66
         fi
 
-        uninstall_kernel_for_grub
+        uninstall_kernel
         exit 0
     fi
 
     if [[ "$need_target" == true && -z "$KERNEL_RELEASE" ]]; then
         KERNEL_RELEASE="$(get_kernel_release)"
-        echo "${WHITE}Using existing build: ${CYAN}${KERNEL_RELEASE}"
-        echo "${NORMAL}"
     fi
 
-    if [[ -n "$INSTALL_MODE" ]]; then
-        case "$INSTALL_MODE" in
+    if [[ "$DO_INSTALL" == true ]]; then
+        case "$BOOT_CHAIN_TYPE" in
             boot)      install_kernel_to_boot_partition ;;
             grub)      install_kernel_for_grub ;;
             extlinux)  install_kernel_for_extlinux ;;
